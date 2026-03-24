@@ -1,0 +1,22 @@
+services:
+  embedding-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: embedding-service
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - huggingface-cache:/root/.cache/huggingface
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 45s
+
+volumes:
+  huggingface-cache:
