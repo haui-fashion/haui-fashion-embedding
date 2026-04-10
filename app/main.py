@@ -35,12 +35,19 @@ model: SentenceTransformer | None = None
 model_name = os.getenv("MODEL_NAME", "intfloat/multilingual-e5-base")
 device = os.getenv("DEVICE", "cpu")
 default_normalize = os.getenv("NORMALIZE_EMBEDDINGS", "true").lower() == "true"
+local_files_only = os.getenv("LOCAL_FILES_ONLY", "false").lower() == "true"
+cache_folder = os.getenv("HF_HOME")
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     global model
-    model = SentenceTransformer(model_name, device=device)
+    model = SentenceTransformer(
+        model_name,
+        device=device,
+        cache_folder=cache_folder,
+        local_files_only=local_files_only,
+    )
     yield
 
 
