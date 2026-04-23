@@ -90,3 +90,27 @@ jobs:
           echo "🚀 Docker image successfully pushed to Docker Hub!"
           echo "📦 Docker Image: ${{ env.DOCKER_IMAGE }}:latest"
           echo "⏳ Watchtower on your server will automatically pull the new image and update the container."
+
+      - name: Notify Telegram on success
+        if: success()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
+            echo "Telegram secrets are not set. Skipping Telegram notification."
+            exit 0
+          fi
+
+          MESSAGE=$(printf "✅ Deploy succeeded for %s\nBranch: %s\nCommit: %s\nActor: %s\nRun: %s/%s/actions/runs/%s" \
+            "$GITHUB_REPOSITORY" \
+            "$GITHUB_REF_NAME" \
+            "$GITHUB_SHA" \
+            "$GITHUB_ACTOR" \
+            "$GITHUB_SERVER_URL" \
+            "$GITHUB_REPOSITORY" \
+            "$GITHUB_RUN_ID")
+
+          curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${MESSAGE}"
