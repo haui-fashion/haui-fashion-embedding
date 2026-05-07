@@ -10,7 +10,7 @@ import numpy as np
 from fastapi import FastAPI, HTTPException, Response
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
 from pydantic import BaseModel, Field, field_validator
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import CrossEncoder, SentenceTransformer
 
 
 class EmbedRequest(BaseModel):
@@ -35,12 +35,45 @@ class EmbedResponse(BaseModel):
     embeddings: list[list[float]]
 
 
+class RerankRequest(BaseModel):
+    query: str = Field(min_length=1)
+    texts: list[str] = Field(min_length=1)
+
+    @field_validator("query")
+    @classmethod
+    def validate_query(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("query must be a non-empty string")
+        return cleaned
+
+    @field_validator("texts")
+    @classmethod
+    def validate_texts(cls, values: list[str]) -> list[str]:
+        cleaned = [item.strip() for item in values if item and item.strip()]
+        if not cleaned:
+            raise ValueError("texts must contain at least one non-empty string")
+        max_batch_size = int(os.getenv("MAX_BATCH_SIZE", "64"))
+        if len(cleaned) > max_batch_size:
+            raise ValueError(f"batch size exceeded MAX_BATCH_SIZE={max_batch_size}")
+        return cleaned
+
+
+class RerankResponse(BaseModel):
+    model: str
+    scores: list[float]
+
+
 model: SentenceTransformer | None = None
+reranker: CrossEncoder | None = None
 model_name = os.getenv("MODEL_NAME", "intfloat/multilingual-e5-base")
 device = os.getenv("DEVICE", "cpu")
 default_normalize = os.getenv("NORMALIZE_EMBEDDINGS", "true").lower() == "true"
 local_files_only = os.getenv("LOCAL_FILES_ONLY", "false").lower() == "true"
 cache_folder = os.getenv("HF_HOME")
+rerank_model_name = os.getenv(
+    "RERANK_MODEL_NAME", "cross-encoder/ms-marco-MiniLM-L-6-v2"
+)
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger("embedding-service")
@@ -70,7 +103,7 @@ def log_event(event: str, **fields: object) -> None:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    global model
+    global model, reranker
     log_event("embedding_model_loading", model=model_name, device=device)
     model = SentenceTransformer(
         model_name,
@@ -79,6 +112,13 @@ async def lifespan(_: FastAPI):
         local_files_only=local_files_only,
     )
     log_event("embedding_model_ready", model=model_name, device=device)
+    log_event("reranker_loading", model=rerank_model_name, device=device)
+    reranker = CrossEncoder(
+        rerank_model_name,
+        device=device,
+        max_length=int(os.getenv("RERANK_MAX_LENGTH", "512")),
+    )
+    log_event("reranker_ready", model=rerank_model_name, device=device)
     yield
 
 
@@ -127,6 +167,27 @@ def _embed_texts(payload: EmbedRequest, input_type: str) -> EmbedResponse:
     return EmbedResponse(model=model_name, dimension=dimension, embeddings=embeddings)
 
 
+def _rerank_texts(payload: RerankRequest) -> RerankResponse:
+    if reranker is None:
+        raise HTTPException(status_code=503, detail="Reranker is not loaded yet")
+
+    pairs = [(payload.query, text) for text in payload.texts]
+    scores = reranker.predict(pairs)
+
+    if isinstance(scores, np.ndarray):
+        score_list = scores.astype(float).tolist()
+    else:
+        score_list = [float(score) for score in scores]
+
+    log_event(
+        "rerank_generated",
+        batch_size=len(payload.texts),
+        model=rerank_model_name,
+    )
+
+    return RerankResponse(model=rerank_model_name, scores=score_list)
+
+
 @app.post("/query", response_model=EmbedResponse)
 def embed_query(payload: EmbedRequest) -> EmbedResponse:
     started_at = time.perf_counter()
@@ -155,5 +216,21 @@ def embed_passage(payload: EmbedRequest) -> EmbedResponse:
         raise
     finally:
         EMBEDDING_REQUEST_DURATION_SECONDS.labels(endpoint="passage").observe(
+            time.perf_counter() - started_at
+        )
+
+
+@app.post("/rerank", response_model=RerankResponse)
+def rerank(payload: RerankRequest) -> RerankResponse:
+    started_at = time.perf_counter()
+    try:
+        response = _rerank_texts(payload)
+        EMBEDDING_REQUESTS_TOTAL.labels(endpoint="rerank", status="success").inc()
+        return response
+    except Exception:
+        EMBEDDING_REQUESTS_TOTAL.labels(endpoint="rerank", status="error").inc()
+        raise
+    finally:
+        EMBEDDING_REQUEST_DURATION_SECONDS.labels(endpoint="rerank").observe(
             time.perf_counter() - started_at
         )
